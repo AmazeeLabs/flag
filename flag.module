@@ -10,7 +10,7 @@ define('FLAG_API_VERSION', 2);
 define('FLAG_ADMIN_PATH', 'admin/structure/flags');
 define('FLAG_ADMIN_PATH_START', 3);
 
-include_once dirname(__FILE__) .'/flag.inc';
+include_once dirname(__FILE__) . '/flag.inc';
 
 /**
  * Implements hook_menu().
@@ -169,6 +169,16 @@ function flag_help($path, $arg) {
     case FLAG_ADMIN_PATH:
       $output = '<p>' . t('This page lists all the <em>flags</em> that are currently defined on this system.') . '</p>';
       return $output;
+    case FLAG_ADMIN_PATH . '/manage/%/fields':
+      $output  = '<p>' . t('Flags can have fields added to them. For example, a "Spam" flag could have a <em>Reason</em> field where a user could type in why he believes the item flagged is spam. A "Bookmarks" flag could have a <em>Folder</em> field into which a user could arrange her bookmarks.') . '</p>';
+      $output .= '<p>' . t('On this page you can add fields to flags, delete them, and otherwise manage them.') . '</p>';
+      $output .= '<p>';
+      $output .=   t('You will also want to pick the <a href="@form-link-type-url">"Form" link type</a> for your flag, or else users won\'t have a means to enter values for the fields. (In case a form isn\'t used, the fields are assigned their default values.)', array('@form-link-type-url' => url('admin/structure/flags/manage/' . $arg[4], array('fragment' => 'edit-link-type'))));
+      if (!module_exists('flag_form')) {
+        $output .= ' <strong>' . t("Note: You don't have the <em>Flag Form</em> module enabled. You'll have to <a href='@enable-url'>enable it</a> to have the \"Form\" link-type.", array('@enable-url' => url('admin/modules'))) . '</strong>';
+      }
+      $output .= '</p>';
+      return $output;
   }
 }
 
@@ -177,13 +187,7 @@ function flag_help($path, $arg) {
  */
 function flag_init() {
   $path = drupal_get_path('module', 'flag');
-  include_once $path .'/includes/flag.token.inc';
-  include_once $path .'/includes/flag.actions.inc';
-
-  if (module_exists('session_api')) {
-    // Set the anonymous user SID immediately, in case the user logs in.
-    flag_set_sid();
-  }
+  include_once $path . '/includes/flag.actions.inc';
 }
 
 /**
@@ -253,7 +257,7 @@ function flag_link($type, $object = NULL, $teaser = FALSE) {
 
     // The flag links are actually fully rendered theme functions.
     // The HTML attribute is set to TRUE to allow whatever the themer desires.
-    $links['flag-'. $flag->name] = array(
+    $links['flag-' . $flag->name] = array(
       'title' => $flag->theme($flag->is_flagged($content_id) ? 'unflag' : 'flag', $content_id),
       'html' => TRUE,
     );
@@ -284,7 +288,7 @@ function flag_link($type, $object = NULL, $teaser = FALSE) {
 function flag_flag_link($flag, $action, $content_id) {
   $token = flag_get_token($content_id);
   return array(
-    'href' => 'flag/'. ($flag->link_type == 'confirm' ? 'confirm/' : '') ."$action/$flag->name/$content_id",
+    'href' => 'flag/' . ($flag->link_type == 'confirm' ? 'confirm/' : '') . "$action/$flag->name/$content_id",
     'query' => drupal_get_destination() + ($flag->link_type == 'confirm' ? array() : array('token' => $token)),
   );
 }
@@ -358,11 +362,11 @@ function flag_form_alter(&$form, &$form_state, $form_id) {
     $flags = flag_get_flags('node', $form['#node_type']->type, $user);
     foreach ($flags as $flag) {
       if ($flag->show_on_form) {
-        $var = 'flag_'. $flag->name .'_default';
+        $var = 'flag_' . $flag->name . '_default';
         $form['workflow']['flag'][$var] = array(
           '#type' => 'checkbox',
           '#title' => $flag->get_label('flag_short', $form['#node_type']->type),
-          '#default_value' => variable_get($var .'_'. $form['#node_type']->type, 0),
+          '#default_value' => variable_get($var . '_' . $form['#node_type']->type, 0),
           '#return_value' => 1,
         );
       }
@@ -379,7 +383,7 @@ function flag_form_alter(&$form, &$form_state, $form_id) {
       );
     }
   }
-  elseif (isset($form['type']) && isset($form['#node']) && ($form_id == $form['type']['#value'] .'_node_form')) {
+  elseif (isset($form['type']) && isset($form['#node']) && ($form_id == $form['type']['#value'] . '_node_form')) {
     $nid = !empty($form['nid']['#value']) ? $form['nid']['#value'] : NULL;
     $flags = flag_get_flags('node', $form['type']['#value'], $user);
 
@@ -494,9 +498,10 @@ function flag_node_update($node) {
  * Shared saving routine between flag_node_insert() and flag_node_update().
  */
 function flag_node_save($node) {
+  global $user;
+
   // Response to the flag checkboxes added to the form in flag_form_alter().
   $remembered = FALSE;
-  $account = user_load($node->uid);
   if (isset($node->flag)) {
     foreach ($node->flag as $name => $state) {
       $flag = flag_get_flag($name);
@@ -508,7 +513,7 @@ function flag_node_save($node) {
         // modification:
         $remembered = TRUE;
       }
-      flag($state ? 'flag' : 'unflag', $name, $node->nid, $account, TRUE);
+      flag($state ? 'flag' : 'unflag', $name, $node->nid, $user);
     }
   }
 }
@@ -561,22 +566,42 @@ function flag_node_translation_change($node) {
 function flag_user_login(&$edit, &$account) {
   // Migrate anonymous flags to this user's account.
   if (module_exists('session_api') && ($sid = flag_get_sid(0))) {
-    // The @ symbol suppresses errors if the user flags a piece of content
-    // they have already flagged as a logged-in user.
-    @db_update('flag_content')
-      ->fields(array(
-        'uid' => $account->uid,
-        'sid' => 0,
-      ))
+    // Get a list of flag_content IDs that will be moved over.
+    $duplicate_flaggings = array();
+    $flaggings = db_select('flag_content', 'fc')
+      ->fields('fc', array('fcid', 'fid', 'content_id'))
       ->condition('uid', 0)
       ->condition('sid', $sid)
-      ->execute();
+      ->execute()
+      ->fetchAllAssoc('fcid', PDO::FETCH_ASSOC);
 
-    // Delete any remaining flags this user had as an anonymous user.
-    db_delete('flag_content')
-      ->condition('uid', 0)
-      ->condition('sid', flag_get_sid(0))
-      ->execute();
+    // Convert anonymous flaggings to their authenticated account.
+    foreach ($flaggings as $fcid => $flagging) {
+      // Each update is wrapped in a try block to prevent unique key errors.
+      // Any duplicate content that was flagged as anonoymous is deleted in the
+      // subsequent db_delete() call.
+      try {
+        db_update('flag_content')
+          ->fields(array(
+            'uid' => $account->uid,
+            'sid' => 0,
+          ))
+          ->condition('fcid', $fcid)
+          ->execute();
+      }
+      catch (Exception $e) {
+        $duplicate_flaggings[$fcid] = $flagging;
+      }
+    }
+
+    // Delete any remaining flags this user had as an anonymous user. We use the
+    // proper unflag action here to make sure the count gets decremented again
+    // and so that other modules can clean up their tables if needed.
+    $anonymous_user = drupal_anonymous_user();
+    foreach ($duplicate_flaggings as $fcid => $flagging) {
+      $flag = flag_get_flag(NULL, $flagging['fid']);
+      $flag->flag('unflag', $flagging['content_id'], $anonymous_user, TRUE);
+    }
 
     // Clean up anonymous cookies.
     FlagCookieStorage::drop();
@@ -623,6 +648,17 @@ function flag_user_account_removal($account) {
   db_delete('flag_content')
     ->condition('uid', $account->uid)
     ->execute();
+
+  // Remove flags that have been done to this user.
+  db_delete('flag_content')
+    ->condition('content_type', 'user')
+    ->condition('content_id', $account->uid)
+    ->execute();
+
+  db_delete('flag_counts')
+    ->condition('content_type', 'user')
+    ->condition('content_id', $account->uid)
+    ->execute();
 }
 
 /**
@@ -636,7 +672,7 @@ function flag_user_view($account, $view_mode) {
       // User has no permission to use this flag.
       continue;
     }
-    if (!$flag->uses_hook_link(array())){
+    if (!$flag->uses_hook_link(array())) {
       // Flag not set to appear on profile.
       continue;
     }
@@ -783,9 +819,9 @@ function flag_confirm($form, &$form_state, $action, $flag, $content_id) {
     '#value' => $content_id,
   );
 
-  $question = $flag->get_label($action .'_confirmation', $content_id);
+  $question = $flag->get_label($action . '_confirmation', $content_id);
   $path = isset($_GET['destination']) ? $_GET['destination'] : '<front>';
-  $yes = $flag->get_label($action .'_short', $content_id);
+  $yes = $flag->get_label($action . '_short', $content_id);
 
   return confirm_form($form, $question, $path, '', $yes);
 }
@@ -855,7 +891,7 @@ function flag_flag($action, $flag, $content_id, $account) {
     $event_name = ($action == 'flag' ? 'flag_flagged_' : 'flag_unflagged_') . $flag->name;
     // We only support flags on entities.
     if (entity_get_info($flag->content_type)) {
-      $variables = array('flag' => $flag, 'flagged_' . $flag->content_type => $content_id, 'flagging_user' => $account);
+      $variables = array('flag' => $flag, 'flagged_' . $flag->content_type => $content_id, 'flagging_user' => $account, 'flagging' =>$flag->get_flagging($content_id,$account->uid));
       rules_invoke_event_by_args($event_name, $variables);
     }
   }
@@ -865,6 +901,11 @@ function flag_flag($action, $flag, $content_id, $account) {
  * Implements hook_flag_access().
  */
 function flag_flag_access($flag, $content_id, $action, $account) {
+  // Do nothing if there is no restriction by authorship.
+  if (empty($flag->access_author)) {
+    return;
+  }
+
   // Restrict access by authorship. It's important that TRUE is never returned
   // here, otherwise we'd grant permission even if other modules denied access.
   if ($flag->content_type == 'node') {
@@ -912,6 +953,11 @@ function flag_flag_access($flag, $content_id, $action, $account) {
 function flag_flag_access_multiple($flag, $content_ids, $account) {
   $access = array();
 
+  // Do nothing if there is no restriction by authorship.
+  if (empty($flag->access_author)) {
+    return $access;
+  }
+
   if ($flag->content_type == 'node') {
     // Restrict access by authorship. This is similar to flag_flag_access()
     // above, but returns an array of 'nid' => $access values. Similarly, we
@@ -936,13 +982,13 @@ function flag_flag_access_multiple($flag, $content_ids, $account) {
     // Restrict access by comment ownership.
     $query = db_select('comment', 'c');
     $query->leftJoin('node', 'n', 'c.nid = n.nid');
-    $result = $query
-      ->fields('c', array('cid', 'nid'))
-      ->addField('c', 'uid', 'comment_uid')
-      ->addField('n', 'uid', 'node_uid')
-      ->condition('c.cid', $content_ids, 'IN')
-      ->execute();
-    while ($row = db_fetch_object($result)) {
+    $query
+      ->fields('c', array('cid', 'nid', 'uid'))
+      ->condition('c.cid', $content_ids, 'IN');
+    $query->addField('c', 'uid', 'comment_uid');
+    $result = $query->execute();
+
+    foreach ($result as $row) {
       if ($flag->access_author == 'node_own') {
         $access[$row->cid] = $row->node_uid != $account->uid ? FALSE : NULL;
       }
@@ -1005,7 +1051,7 @@ function flag_reset_flag($flag, $content_id = NULL) {
     $query->condition('content_id', $content_id);
   }
 
-  $result = $query->execute()->fetchAllAssoc('fcid', PDO::FETCH_ASSOC);;
+  $result = $query->execute()->fetchAllAssoc('fcid', PDO::FETCH_ASSOC);
   $rows = array();
   foreach ($result as $row) {
     $rows[] = $row;
@@ -1052,7 +1098,7 @@ function flag_node_operations() {
  */
 function flag_nodes($nodes, $action, $flag_name) {
   $performed = FALSE;
-  foreach ($nodes as $nid) {
+  foreach ($nodes as $nid) {  	
     $performed |= flag($action, $flag_name, $nid);
   }
   if ($performed) {
@@ -1084,8 +1130,8 @@ function flag_user_operations() {
   return $operations;
 }
 /**
-* Callback function for hook_user_operations().
-*/
+ * Callback function for hook_user_operations().
+ */
 function flag_users($users, $action, $flag_name) {
   foreach ($users as $uid) {
     flag($action, $flag_name, $uid);
@@ -1105,93 +1151,10 @@ function flag_mail($key, &$message, $params) {
 }
 
 /**
- * Implements hook_service().
- */
-function flag_service() {
-  $items = array();
-
-  $items[] = array(
-    '#method' => 'flag.flag',
-    '#callback' => 'flag_service_flag',
-    '#access callback' => 'flag_service_flag_access',
-    '#file' => array(
-      'file' => 'inc',
-      'module' => 'flag',
-      'file name' => 'includes/flag.services',
-    ),
-    '#args' => array(
-      array(
-        '#name' => 'flag_name',
-        '#type' => 'string',
-        '#description' => t('The name of the flag.'),
-      ),
-      array(
-        '#name' => 'content_id',
-        '#type' => 'int',
-        '#description' => t('The content ID.'),
-      ),
-      array(
-        '#name' => 'uid',
-        '#type' => 'int',
-        '#description' => t('The user ID for which to flag.'),
-        '#optional' => TRUE,
-      ),
-      array(
-        '#name' => 'action',
-        '#type' => 'string',
-        '#description' => t('Optional; The action to perform, default is "flag". Should be "flag" or "unflag".'),
-        '#optional' => TRUE,
-      ),
-      array(
-        '#name' => 'skip_permission_check',
-        '#type' => 'boolean',
-        '#description' => t('Optional; Flag the content even if the user does not have permission to do so. FALSE by default'),
-        '#optional' => TRUE,
-      ),
-    ),
-    '#return' => 'boolean',
-    '#help' => t('Flags (or unflags) a content.')
-  );
-
-  $items[] = array(
-    '#method' => 'flag.is_flagged',
-    '#callback' => 'flag_service_is_flagged',
-    '#access callback' => 'flag_service_flag_access',
-    '#file' => array(
-      'file' => 'inc',
-      'module' => 'flag',
-      'file name' => 'includes/flag.services',
-    ),
-    '#args' => array(
-      array(
-        '#name' => 'flag_name',
-        '#type' => 'string',
-        '#description' => t('The name of the flag.'),
-      ),
-      array(
-        '#name' => 'content_id',
-        '#type' => 'int',
-        '#description' => t('The content ID.'),
-      ),
-      array(
-        '#name' => 'uid',
-        '#type' => 'int',
-        '#description' => t('The user ID that might have flagged the content.'),
-        '#optional' => TRUE,
-      ),
-    ),
-    '#return' => 'boolean',
-    '#help' => t('Check if a content was flagged by a user.')
-  );
-
-  return $items;
-}
-
-/**
  * Implements hook_theme().
  */
 function flag_theme() {
-  $path = drupal_get_path('module', 'flag') .'/theme';
+  $path = drupal_get_path('module', 'flag') . '/theme';
 
   return array(
     'flag' => array(
@@ -1202,10 +1165,18 @@ function flag_theme() {
     ),
     'flag_tokens_browser' => array(
       'variables' => array('types' => array('all'), 'global_types' => TRUE),
-      'file' => 'includes/flag.token.inc',
+      'file' => 'flag.tokens.inc',
+    ),
+    'flag_admin_listing' => array(
+      'render element' => 'form',
+      'file' => 'includes/flag.admin.inc',
+    ),
+    'flag_admin_listing_disabled' => array(
+      'variables' => array('flags' => NULL, 'default_flags' => NULL),
+      'file' => 'includes/flag.admin.inc',
     ),
     'flag_admin_page' => array(
-      'variables' => array('flags' => NULL, 'default_flags' => NULL),
+      'variables' => array('flags' => NULL, 'default_flags' => NULL, 'flag_admin_listing' => NULL),
       'file' => 'includes/flag.admin.inc',
     ),
     'flag_form_roles' => array(
@@ -1266,10 +1237,12 @@ function template_preprocess_flag(&$variables) {
     $initialized[$link_type['name']] = TRUE;
   }
 
+  $variables['link'] = $link;
   $variables['link_href'] = isset($link['href']) ? check_url(url($link['href'], $link)) : FALSE;
   $variables['link_text'] = isset($link['title']) ? $link['title'] : $flag->get_label($action . '_short', $content_id);
   $variables['link_title'] = isset($link['attributes']['title']) ? check_plain($link['attributes']['title']) : check_plain(strip_tags($flag->get_label($action . '_long', $content_id)));
   $variables['status'] = ($action == 'flag' ? 'unflagged' : 'flagged');
+  $variables['flag_name_css'] = $flag_css_name;
 
   $variables['flag_wrapper_classes_array'] = array();
   $variables['flag_wrapper_classes_array'][] = 'flag-wrapper';
@@ -1279,10 +1252,11 @@ function template_preprocess_flag(&$variables) {
 
   $variables['flag_classes_array'] = array();
   $variables['flag_classes_array'][] = 'flag';
-  $variables['flag_classes_array'][] = $variables['action'] .'-action';
-  $variables['flag_classes_array'][] = 'flag-link-'. $flag->link_type;
+  $variables['flag_classes_array'][] = $variables['action'] . '-action';
+  $variables['flag_classes_array'][] = 'flag-link-' . $flag->link_type;
   if (isset($link['attributes']['class'])) {
-    $variables['flag_classes_array'][] = $link['attributes']['class'];
+    $link['attributes']['class'] = is_string($link['attributes']['class']) ? array_filter(explode(' ', $link['attributes']['class'])) : $link['attributes']['class'];
+    $variables['flag_classes_array'] = array_merge($variables['flag_classes_array'], $link['attributes']['class']);
   }
   if ($variables['after_flagging']) {
     $inverse_action = ($action == 'flag' ? 'unflag' : 'flag');
@@ -1503,6 +1477,9 @@ function flag_get_flags($content_type = NULL, $content_subtype = NULL, $account 
       }
     }
 
+    // Sort the list of flags by weight.
+    uasort($flags, '_flag_compare_weight');
+
     // Allow modules implementing hook_flag_alter(&$flag) to modify each flag.
     foreach ($flags as $flag) {
       drupal_alter('flag', $flag);
@@ -1533,6 +1510,16 @@ function flag_get_flags($content_type = NULL, $content_subtype = NULL, $account 
   }
 
   return $filtered_flags;
+}
+
+/**
+ * Comparison function for uasort().
+ */
+function _flag_compare_weight($flag1, $flag2) {
+  if ($flag1->weight == $flag2->weight) {
+    return 0;
+  }
+  return $flag1->weight < $flag2->weight ? -1 : 1;
 }
 
 /**
@@ -1826,11 +1813,8 @@ function flag_check_token($token, $content_id) {
 
 /**
  * Set the Session ID for a user. Utilizes the Session API module.
- *
- * This function is only called in flag_init(), to set the current user's
- * SID in case the user logs in during this request.
  */
-function flag_set_sid($uid = NULL) {
+function flag_set_sid($uid = NULL, $create = TRUE) {
   static $sids = array();
 
   if (!isset($uid)) {
@@ -1839,7 +1823,7 @@ function flag_set_sid($uid = NULL) {
 
   if (!isset($sids[$uid])) {
     if (module_exists('session_api') && session_api_available() && $uid == 0) {
-      $sids[$uid] = session_api_get_sid();
+      $sids[$uid] = session_api_get_sid($create);
     }
     else {
       $sids[$uid] = 0;
@@ -1851,7 +1835,14 @@ function flag_set_sid($uid = NULL) {
 
 /**
  * Get the Session ID for a user. Utilizes the Session API module.
+ *
+ * @param $uid
+ *   The user ID. If the UID is 0 (anonymous users), then a SID will be
+ *   returned. SID will always be 0 for any authenticated user.
+ * @param $create
+ *   If the user doesn't yet have a session, should one be created? Defaults
+ *   to FALSE.
  */
-function flag_get_sid($uid = NULL) {
-  return flag_set_sid($uid);
+function flag_get_sid($uid = NULL, $create = FALSE) {
+  return flag_set_sid($uid, $create);
 }

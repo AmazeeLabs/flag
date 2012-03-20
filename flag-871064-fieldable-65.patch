@@ -1,0 +1,450 @@
+diff --git a/flag.inc b/flag.inc
+index ca27db4..b1a54a1 100644
+--- a/flag.inc
++++ b/flag.inc
+@@ -6,6 +6,8 @@
+  * of Views 2.
+  */
+ 
++ include_once dirname(__FILE__) . '/includes/flag.entity.inc';
++
+ /**
+  * Implements hook_flag_definitions().
+  *
+@@ -565,11 +567,15 @@ class flag_flag {
+    *   The user on whose behalf to flag. Leave empty for the current user.
+    * @param $skip_permission_check
+    *   Flag the item even if the $account user don't have permission to do so.
++   * @param $flagging
++   *   Optional. This method works in tandem with Drupal's Field subsystem.
++   *   Pass in a flagging entity if you want operate on it as well.
++   *
+    * @return
+    *   FALSE if some error occured (e.g., user has no permission, flag isn't
+    *   applicable to the item, etc.), TRUE otherwise.
+    */
+-  function flag($action, $content_id, $account = NULL, $skip_permission_check = FALSE) {
++   function flag($action, $content_id, $account = NULL, $skip_permission_check = FALSE, $flagging = NULL) {
+     if (!isset($account)) {
+       $account = $GLOBALS['user'];
+     }
+@@ -610,15 +616,31 @@ class flag_flag {
+       }
+     }
+ 
++    // Set our uid and sid to the flagging object.
++    if (isset($flagging)) {
++      $flagging->uid = $uid;
++      $flagging->sid = $sid;
++    }
++
++    // @todo: Discuss: Should we call field_attach_validate()? None of the
++    // entities in core does this (fields entered through forms are already
++    // validated).
++    //
++    // @todo: Discuss: Core wraps everything in a try { }, should we?
++
+     // Perform the flagging or unflagging of this flag.
+-    $flagged = $this->_is_flagged($content_id, $uid, $sid);
++    $existing_fcid = $this->_is_flagged($content_id, $uid, $sid);
++    $flagged = (bool) $existing_fcid;
+     if ($action == 'unflag') {
+       if ($this->uses_anonymous_cookies()) {
+         $this->_unflag_anonymous($content_id);
+       }
+       if ($flagged) {
+-        $fcid = $this->_unflag($content_id, $uid, $sid);
+-        module_invoke_all('flag', 'unflag', $this, $content_id, $account, $fcid);
++        // Note the order: We delete the entity before calling _unflag() to
++        // delete the {flag_content} record.
++        $this->_delete_flagging($existing_fcid);
++        $this->_unflag($content_id, $uid, $sid);
++        module_invoke_all('flag', 'unflag', $this, $content_id, $account, $existing_fcid);
+       }
+     }
+     elseif ($action == 'flag') {
+@@ -626,15 +648,84 @@ class flag_flag {
+         $this->_flag_anonymous($content_id);
+       }
+       if (!$flagged) {
++        if (!isset($flagging)) {
++          $flagging = $this->new_flagging($content_id, $uid, $sid);
++        }
+         $fcid = $this->_flag($content_id, $uid, $sid);
++        // We're writing out a flagging entity even when we aren't passed one
++        // (e.g., when flagging via JavaScript toggle links); in this case
++        // Field API will assign the fields their default values.
++        $this->_insert_flagging($flagging, $content_id, $fcid);
+         module_invoke_all('flag', 'flag', $this, $content_id, $account, $fcid);
+       }
++      else {
++        // Nothing to do. Item is already flagged.
++        //
++        // Except in the case a $flagging object is passed in: in this case
++        // we're, for example, arriving from an editing form and need to update
++        // the entity.
++        if ($flagging) {
++          $this->_update_flagging($flagging);
++        }
++      }
+     }
+ 
+     return TRUE;
+   }
+ 
+   /**
++   * The entity CRUD methods _{insert,update,delete}_flagging() are for private
++   * use by the flag() method.
++   *
++   * The reason programmers should not call them directly is because a flagging
++   * operation is also accompanied by some bookkeeping (calling hooks, updating
++   * counters) or access control. These tasks are handled by the flag() method.
++   */
++  private function _insert_flagging($flagging, $content_id, $fcid) {
++    $flagging->fcid = $fcid;
++    field_attach_presave('flagging', $flagging);
++    field_attach_insert('flagging', $flagging);
++  }
++  private function _update_flagging($flagging) {
++    field_attach_presave('flagging', $flagging);
++    field_attach_update('flagging', $flagging);
++    // Update the cache.
++    flagging_load($flagging->fcid, TRUE);
++  }
++  private function _delete_flagging($fcid) {
++    if (($flagging = flagging_load($fcid))) {
++      field_attach_delete('flagging', $flagging);
++      // Remove from the cache.
++      flagging_load($fcid, TRUE);
++    }
++  }
++
++  /**
++   * Construct a new, empty flagging entity object.
++   *
++   * @param mixed $content_id
++   *   The unique identifier of the content being flagged.
++   * @param int $uid
++   *   Optional. The user id of the user doing the flagging.
++   * @param mixed $sid
++   *   Optional. The user SID (provided by Session API) who is doing the
++   *   flagging. The SID is 0 for logged in users.
++   * @return stdClass
++   *   The returned object has at least the 'flag_name' property set, which
++   *   enables Field API to figure out the bundle, but it's your responsibility
++   *   to eventually populate 'content_id' and 'fcid'.
++   */
++  function new_flagging($content_id = NULL, $uid = NULL, $sid = NULL) {
++    return (object) array(
++      'fcid' => NULL,
++      'flag_name' => $this->name,
++      'content_id' => $content_id,
++      'uid' => $uid,
++      'sid' => $sid,
++    );
++  }
++
++  /**
+    * Determines if a certain user has flagged this content.
+    *
+    * Thanks to using a cache, inquiring several different flags about the same
+@@ -674,6 +765,15 @@ class flag_flag {
+   }
+ 
+   /**
++   * Similar to is_flagged() excepts it returns the flagging entity.
++   */
++  function get_flagging($content_id, $uid = NULL, $sid = NULL) {
++    if (($record = $this->get_flagging_record($content_id, $uid, $sid))) {
++      return flagging_load($record->fcid);
++    }
++  }
++
++  /**
+    * Determines if a certain user has flagged this content.
+    *
+    * You probably shouldn't call this raw private method: call the
+@@ -898,6 +998,11 @@ class flag_flag {
+    * token contexts they understand.
+    */
+   function replace_tokens($label, $contexts, $options, $content_id) {
++    if (strpos($label , 'flagging:') !== FALSE) {
++      if (($flagging = $this->get_flagging($content_id))) {
++        $contexts['flagging'] = $flagging;
++      }
++    }
+     return token_replace($label, $contexts, $options);
+   }
+ 
+@@ -909,7 +1014,7 @@ class flag_flag {
+    * Derived classes should override this.
+    */
+   function get_labels_token_types() {
+-    return array();
++    return array('flagging');
+   }
+ 
+   /**
+@@ -1359,9 +1464,9 @@ class flag_node extends flag_flag {
+     return FALSE;
+   }
+ 
+-  function flag($action, $content_id, $account = NULL, $skip_permission_check = FALSE) {
++  function flag($action, $content_id, $account = NULL, $skip_permission_check = FALSE, $flagging = NULL) {
+     $content_id = $this->get_translation_id($content_id);
+-    return parent::flag($action, $content_id, $account, $skip_permission_check);
++    return parent::flag($action, $content_id, $account, $skip_permission_check, $flagging);
+   }
+ 
+   // Instead of overriding is_flagged() we override get_flagging_record(),
+diff --git a/flag.info b/flag.info
+index 99e4142..9f4ba49 100644
+--- a/flag.info
++++ b/flag.info
+@@ -6,6 +6,7 @@ configure = admin/structure/flags
+ 
+ ; Files that contain classes.
+ files[] = flag.inc
++files[] = includes/flag.entity.inc
+ files[] = flag.rules.inc
+ files[] = includes/flag_handler_argument_content_id.inc
+ files[] = includes/flag_handler_field_ops.inc
+diff --git a/flag.module b/flag.module
+index 957bb12..558de9c 100644
+--- a/flag.module
++++ b/flag.module
+@@ -169,6 +169,16 @@ function flag_help($path, $arg) {
+     case FLAG_ADMIN_PATH:
+       $output = '<p>' . t('This page lists all the <em>flags</em> that are currently defined on this system.') . '</p>';
+       return $output;
++    case FLAG_ADMIN_PATH . '/manage/%/fields':
++      $output  = '<p>' . t('Flags can have fields added to them. For example, a "Spam" flag could have a <em>Reason</em> field where a user could type in why he believes the item flagged is spam. A "Bookmarks" flag could have a <em>Folder</em> field into which a user could arrange her bookmarks.') . '</p>';
++      $output .= '<p>' . t('On this page you can add fields to flags, delete them, and otherwise manage them.') . '</p>';
++      $output .= '<p>';
++      $output .=   t('You will also want to pick the <a href="@form-link-type-url">"Form" link type</a> for your flag, or else users won\'t have a means to enter values for the fields. (In case a form isn\'t used, the fields are assigned their default values.)', array('@form-link-type-url' => url('admin/structure/flags/manage/' . $arg[4], array('fragment' => 'edit-link-type'))));
++      if (!module_exists('flag_form')) {
++        $output .= ' <strong>' . t("Note: You don't have the <em>Flag Form</em> module enabled. You'll have to <a href='@enable-url'>enable it</a> to have the \"Form\" link-type.", array('@enable-url' => url('admin/modules'))) . '</strong>';
++      }
++      $output .= '</p>';
++      return $output;
+   }
+ }
+ 
+@@ -881,7 +891,7 @@ function flag_flag($action, $flag, $content_id, $account) {
+     $event_name = ($action == 'flag' ? 'flag_flagged_' : 'flag_unflagged_') . $flag->name;
+     // We only support flags on entities.
+     if (entity_get_info($flag->content_type)) {
+-      $variables = array('flag' => $flag, 'flagged_' . $flag->content_type => $content_id, 'flagging_user' => $account);
++      $variables = array('flag' => $flag, 'flagged_' . $flag->content_type => $content_id, 'flagging_user' => $account, 'flagging' =>$flag->get_flagging($content_id,$account->uid));
+       rules_invoke_event_by_args($event_name, $variables);
+     }
+   }
+diff --git a/flag.rules.inc b/flag.rules.inc
+index f7cd84e..9b99050 100644
+--- a/flag.rules.inc
++++ b/flag.rules.inc
+@@ -17,6 +17,11 @@ function flag_rules_data_info() {
+       'wrapper class' => 'FlagRulesDataWrapper',
+       'wrap' => TRUE,
+     ),
++    'flagging' => array(
++      'label' => t('flagging'),
++      'parent' => 'entity',
++      'group' => t('flag'),
++    ),
+   );
+ }
+ 
+@@ -129,6 +134,10 @@ function flag_rules_event_info() {
+           'type' => 'user',
+           'label' => t('flagging user'),
+         ),
++        'flagging' => array(
++          'type' => 'flagging',
++          'label' => t('flagging'),
++        ),
+       );
+ 
+       // For each flag we define two events.
+diff --git a/flag.tokens.inc b/flag.tokens.inc
+index e6707cf..64f15e9 100644
+--- a/flag.tokens.inc
++++ b/flag.tokens.inc
+@@ -27,6 +27,22 @@ function flag_token_info() {
+     'description' => t('The human-readable flag title.'),
+   );
+ 
++  // Flagging tokens.
++  //
++  // Attached fields are exposed as tokens via some contrib module, but we
++  // need to expose other fields ourselves. Currently, 'date' is the only such
++  // field we expose.
++  $types['flagging'] = array(
++    'name' => t('Flaggings'),
++    'description' => t('Tokens related to flaggings.'),
++    'needs-data' => 'flagging',
++  );
++  $tokens['flagging']['date'] = array(
++    'name' => t('Flagging date'),
++    'description' => t('The date an item was flagged.'),
++    'type' => 'date',
++  );
++
+   // Flage action tokens.
+   $types['flag-action'] = array(
+     'name' => t('Flag actions'),
+@@ -85,6 +101,7 @@ function flag_token_info() {
+ function flag_tokens($type, $tokens, array $data = array(), array $options = array()) {
+   $replacements = array();
+   $sanitize = !empty($options['sanitize']);
++  $langcode = isset($options['language']) ? $options['language']->language : NULL;
+ 
+   if ($type == 'flag' && !empty($data['flag'])) {
+     $flag = $data['flag'];
+@@ -99,6 +116,19 @@ function flag_tokens($type, $tokens, array $data = array(), array $options = arr
+       }
+     }
+   }
++  elseif ($type == 'flagging' && !empty($data['flagging'])) {
++    $flagging = $data['flagging'];
++    foreach ($tokens as $name => $original) {
++      switch ($name) {
++        case 'date':
++          $replacements[$original] = format_date($flagging->timestamp, 'medium', '', NULL, $langcode);
++          break;
++      }
++    }
++    if ($date_tokens = token_find_with_prefix($tokens, 'date')) {
++      $replacements += token_generate('date', $date_tokens, array('date' => $flagging->timestamp), $options);
++    }
++  }
+   elseif ($type == 'flag-action' && !empty($data['flag-action'])) {
+     $action = $data['flag-action'];
+     foreach ($tokens as $name => $original) {
+diff --git a/includes/flag.admin.inc b/includes/flag.admin.inc
+index cd51eee..519d283 100644
+--- a/includes/flag.admin.inc
++++ b/includes/flag.admin.inc
+@@ -67,10 +67,13 @@ function theme_flag_admin_listing($variables) {
+   foreach ($flags as $flag) {
+     $ops = array(
+       'flags_edit' =>  array('title' => t('edit'), 'href' => $flag->admin_path('edit')),
++      'flags_fields' =>  array('title' => t('manage fields'), 'href' => $flag->admin_path('fields')),
+       'flags_delete' =>  array('title' => t('delete'), 'href' => $flag->admin_path('delete')),
+       'flags_export' =>  array('title' => t('export'), 'href' => $flag->admin_path('export')),
+     );
+-
++    if (!module_exists('field_ui')) {
++      unset($ops['flags_fields']);
++    }
+     $roles = array_flip(array_intersect(array_flip(user_roles()), $flag->roles['flag']));
+     $row = array(
+       $flag->name,
+diff --git a/includes/flag.entity.inc b/includes/flag.entity.inc
+new file mode 100644
+index 0000000..9555d76
+--- /dev/null
++++ b/includes/flag.entity.inc
+@@ -0,0 +1,102 @@
++<?php
++
++/**
++ * @file
++ * Provides supporting code for the entity/fields system.
++ *
++ * Note: We're making the <em>flaggings</em> fieldable, not the <em>flags</em>.
++ * (In the same way that Drupal makes <em>nodes</em> fieldable, not <em>node
++ * types</em>).
++ */
++
++/**
++ * Implements hook_entity_info().
++ */
++function flag_entity_info() {
++  $return = array(
++    'flagging' => array(
++      'label' => t('Flagging'),
++      'controller class' => 'FlaggingController',
++      'base table' => 'flag_content',
++      'fieldable' => TRUE,
++      'entity keys' => array(
++        'id' => 'fcid',
++        'bundle' => 'flag_name',
++      ),
++      // The following tells Field UI how to extract the bundle name from a
++      // $flag object when we're visiting ?q=admin/.../manage/%flag/fields.
++      'bundle keys' => array(
++        'bundle' => 'name',
++      ),
++      'bundles' => array(),
++    ),
++  );
++
++  foreach (flag_get_flags(NULL, NULL, NULL, TRUE) as $flag) {
++    $return['flagging']['bundles'][$flag->name] = array(
++      'label' => $flag->title,
++      'admin' => array(
++        'path' => FLAG_ADMIN_PATH . '/manage/%flag',
++        'real path' => FLAG_ADMIN_PATH . '/manage/' . $flag->name,
++        'bundle argument' => FLAG_ADMIN_PATH_START + 1,
++        'access arguments' => array('administer flags'),
++      ),
++    );
++  }
++
++  return $return;
++}
++
++/**
++ * Controller class for flaggings.
++ */
++class FlaggingController extends DrupalDefaultEntityController {
++
++  protected function buildQuery($ids, $conditions = array(), $revision_id = FALSE) {
++    $query = parent::buildQuery($ids, $conditions, $revision_id);
++    // Add the flag name, which determines the bundle.
++    $query->innerJoin('flags', 'flags', 'base.fid = flags.fid');
++    $query->addField('flags', 'name', 'flag_name');
++    return $query;
++  }
++}
++
++/**
++ * Loads a flagging entity.
++ *
++ * @param $fcid
++ *   The 'fcid' database serial column.
++ * @param $reset
++ *   Whether to reset the DrupalDefaultEntityController cache.
++ *
++ * @return
++ *   The entity object, or FALSE if it can't be found.
++ */
++function flagging_load($fcid, $reset = FALSE) {
++  $result = entity_load('flagging', array($fcid), array(), $reset);
++  return reset($result);
++}
++
++// @todo: Implement flagging_save(). It's not required but other modules may expect it.
++
++// @todo: Implement flagging_view(). Not extremely useful. I already have it.
++
++// @todo: When renaming a flag: Call field_attach_rename_bundle().
++
++// @todo: When creating a flag: Call field_attach_create_bundle().
++
++// @todo: When deleting a flag: Call field_attach_delete_bundle().
++
++// @tood: Discuss: Should flag deleting call flag_reset_flag()? No.
++
++// @todo: flag_reset_flag():
++// - it should delete the flaggings.
++// - (it has other issues; see http://drupal.org/node/894992.)
++// - (is problematic: it might not be possible to delete all data in a single page request.)
++
++// @todo: Discuss: Note that almost all functions/identifiers dealing with
++// flaggings *aren't* prefixed by "flag_". For example:
++//  - The menu argument is %flagging, not %flag_flagging.
++//  - The entity type is "flagging", not "flag_flagging".
++// On the one hand this succinct version is readable and nice. On the other hand, it isn't
++// very "correct".

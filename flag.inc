@@ -6,6 +6,8 @@
  * of Views 2.
  */
 
+ include_once dirname(__FILE__) . '/includes/flag.entity.inc';
+
 /**
  * Implements hook_flag_definitions().
  *
@@ -39,23 +41,24 @@ function flag_flag_definitions() {
  * Returns a flag definition.
  */
 function flag_fetch_definition($content_type = NULL) {
-  static $cache;
-  if (!isset($cache)) {
-    $cache = module_invoke_all('flag_definitions');
-    if (!isset($cache['node'])) {
+  static $defintions;
+  if (!isset($defintions)) {
+    $defintions = module_invoke_all('flag_definitions');
+    drupal_alter('flag_definitions', $defintions);
+    if (!isset($defintions['node'])) {
       // We want our API to be available in hook_install, but our module is not
       // enabled by then, so let's load our implementation directly:
-      $cache += flag_flag_definitions();
+      $defintions += flag_flag_definitions();
     }
   }
 
   if (isset($content_type)) {
-    if (isset($cache[$content_type])) {
-      return $cache[$content_type];
+    if (isset($defintions[$content_type])) {
+      return $defintions[$content_type];
     }
   }
   else {
-    return $cache;
+    return $defintions;
   }
 }
 
@@ -193,6 +196,7 @@ class flag_flag {
         'flag' => array(DRUPAL_AUTHENTICATED_RID),
         'unflag' => array(DRUPAL_AUTHENTICATED_RID),
       ),
+      'weight' => 0,
     );
 
     // Merge in options from the current link type.
@@ -405,6 +409,9 @@ class flag_flag {
   /**
    * Returns TRUE if the user can flag, or unflag, the given content.
    *
+   * This method typically should not be overridden by child classes. Instead
+   * they should implement type_access(), which is called by this method.
+   *
    * @param $content_id
    *   The content ID to flag/unflag.
    * @param $account
@@ -433,6 +440,12 @@ class flag_flag {
     // Base initial access on the user's basic permission to use this flag.
     $access = $this->user_access($action, $account);
 
+    // Check for additional access rules provided by sub-classes.
+    $child_access = $this->type_access($content_id, $action, $account);
+    if (isset($child_access)) {
+      $access = $child_access;
+    }
+
     // Allow modules to disallow (or allow) access to flagging.
     $access_array = module_invoke_all('flag_access', $this, $content_id, $action, $account);
 
@@ -452,6 +465,10 @@ class flag_flag {
    * test in the Views query, is to make 'many to one' tests possible without
    * interfering with the rows, and also to reduce the complexity of the code.
    *
+   * This method typically should not be overridden by child classes. Instead
+   * they should implement type_access_multiple(), which is called by this
+   * method.
+   *
    * @param $content_ids
    *   The array of content IDs to check. The keys are the content IDs, the
    *   values are the actions to test: either 'flag' or 'unflag'.
@@ -468,6 +485,16 @@ class flag_flag {
       $access[$content_id] = $this->user_access($content_ids[$content_id], $account);
     }
 
+    // Check for additional access rules provided by sub-classes.
+    $child_access = $this->type_access_multiple($content_ids, $account);
+    if (isset($child_access)) {
+      foreach ($child_access as $content_id => $content_access) {
+        if (isset($content_access)) {
+          $access[$content_id] = $content_access;
+        }
+      }
+    }
+
     // Merge in module-defined access.
     foreach (module_implements('flag_access_multiple') as $module) {
       $module_access = module_invoke($module, 'flag_access_multiple', $this, $content_ids, $account);
@@ -479,6 +506,24 @@ class flag_flag {
     }
 
     return $access;
+  }
+
+  /**
+   * Implements access() implemented by each child class.
+   *
+   * @abstract
+   */
+  function type_access($content_id, $action, $account) {
+    return NULL;
+  }
+
+  /**
+   * Implements access_multiple() implemented by each child class.
+   *
+   * @abstract
+   */
+  function type_access_multiple($content_ids, $account) {
+    return array();
   }
 
   /**
@@ -522,11 +567,15 @@ class flag_flag {
    *   The user on whose behalf to flag. Leave empty for the current user.
    * @param $skip_permission_check
    *   Flag the item even if the $account user don't have permission to do so.
+   * @param $flagging
+   *   Optional. This method works in tandem with Drupal's Field subsystem.
+   *   Pass in a flagging entity if you want operate on it as well.
+   *
    * @return
    *   FALSE if some error occured (e.g., user has no permission, flag isn't
    *   applicable to the item, etc.), TRUE otherwise.
    */
-  function flag($action, $content_id, $account = NULL, $skip_permission_check = FALSE) {
+   function flag($action, $content_id, $account = NULL, $skip_permission_check = FALSE, $flagging = NULL) {
     if (!isset($account)) {
       $account = $GLOBALS['user'];
     }
@@ -560,22 +609,38 @@ class flag_flag {
       $sid = 0;
     }
     else {
-      $sid = flag_get_sid($uid);
+      $sid = flag_get_sid($uid, TRUE);
       // Anonymous users must always have a session id.
       if ($sid == 0 && $account->uid == 0) {
         return FALSE;
       }
     }
 
+    // Set our uid and sid to the flagging object.
+    if (isset($flagging)) {
+      $flagging->uid = $uid;
+      $flagging->sid = $sid;
+    }
+
+    // @todo: Discuss: Should we call field_attach_validate()? None of the
+    // entities in core does this (fields entered through forms are already
+    // validated).
+    //
+    // @todo: Discuss: Core wraps everything in a try { }, should we?
+
     // Perform the flagging or unflagging of this flag.
-    $flagged = $this->_is_flagged($content_id, $uid, $sid);
+    $existing_fcid = $this->_is_flagged($content_id, $uid, $sid);
+    $flagged = (bool) $existing_fcid;
     if ($action == 'unflag') {
       if ($this->uses_anonymous_cookies()) {
         $this->_unflag_anonymous($content_id);
       }
       if ($flagged) {
-        $fcid = $this->_unflag($content_id, $uid, $sid);
-        module_invoke_all('flag', 'unflag', $this, $content_id, $account, $fcid);
+        // Note the order: We delete the entity before calling _unflag() to
+        // delete the {flag_content} record.
+        $this->_delete_flagging($existing_fcid);
+        $this->_unflag($content_id, $uid, $sid);
+        module_invoke_all('flag', 'unflag', $this, $content_id, $account, $existing_fcid);
       }
     }
     elseif ($action == 'flag') {
@@ -583,12 +648,81 @@ class flag_flag {
         $this->_flag_anonymous($content_id);
       }
       if (!$flagged) {
+        if (!isset($flagging)) {
+          $flagging = $this->new_flagging($content_id, $uid, $sid);
+        }
         $fcid = $this->_flag($content_id, $uid, $sid);
+        // We're writing out a flagging entity even when we aren't passed one
+        // (e.g., when flagging via JavaScript toggle links); in this case
+        // Field API will assign the fields their default values.
+        $this->_insert_flagging($flagging, $content_id, $fcid);
         module_invoke_all('flag', 'flag', $this, $content_id, $account, $fcid);
+      }
+      else {
+        // Nothing to do. Item is already flagged.
+        //
+        // Except in the case a $flagging object is passed in: in this case
+        // we're, for example, arriving from an editing form and need to update
+        // the entity.
+        if ($flagging) {
+          $this->_update_flagging($flagging);
+        }
       }
     }
 
     return TRUE;
+  }
+
+  /**
+   * The entity CRUD methods _{insert,update,delete}_flagging() are for private
+   * use by the flag() method.
+   *
+   * The reason programmers should not call them directly is because a flagging
+   * operation is also accompanied by some bookkeeping (calling hooks, updating
+   * counters) or access control. These tasks are handled by the flag() method.
+   */
+  private function _insert_flagging($flagging, $content_id, $fcid) {
+    $flagging->fcid = $fcid;
+    field_attach_presave('flagging', $flagging);
+    field_attach_insert('flagging', $flagging);
+  }
+  private function _update_flagging($flagging) {
+    field_attach_presave('flagging', $flagging);
+    field_attach_update('flagging', $flagging);
+    // Update the cache.
+    flagging_load($flagging->fcid, TRUE);
+  }
+  private function _delete_flagging($fcid) {
+    if (($flagging = flagging_load($fcid))) {
+      field_attach_delete('flagging', $flagging);
+      // Remove from the cache.
+      flagging_load($fcid, TRUE);
+    }
+  }
+
+  /**
+   * Construct a new, empty flagging entity object.
+   *
+   * @param mixed $content_id
+   *   The unique identifier of the content being flagged.
+   * @param int $uid
+   *   Optional. The user id of the user doing the flagging.
+   * @param mixed $sid
+   *   Optional. The user SID (provided by Session API) who is doing the
+   *   flagging. The SID is 0 for logged in users.
+   * @return stdClass
+   *   The returned object has at least the 'flag_name' property set, which
+   *   enables Field API to figure out the bundle, but it's your responsibility
+   *   to eventually populate 'content_id' and 'fcid'.
+   */
+  function new_flagging($content_id = NULL, $uid = NULL, $sid = NULL) {
+    return (object) array(
+      'fcid' => NULL,
+      'flag_name' => $this->name,
+      'content_id' => $content_id,
+      'uid' => $uid,
+      'sid' => $sid,
+    );
   }
 
   /**
@@ -628,6 +762,15 @@ class flag_flag {
     // flag_get_user_flags() does caching.
     $user_flags = flag_get_user_flags($this->content_type, $content_id, $uid, $sid);
     return isset($user_flags[$this->name]) ? $user_flags[$this->name] : NULL;
+  }
+
+  /**
+   * Similar to is_flagged() excepts it returns the flagging entity.
+   */
+  function get_flagging($content_id, $uid = NULL, $sid = NULL) {
+    if (($record = $this->get_flagging_record($content_id, $uid, $sid))) {
+      return flagging_load($record->fcid);
+    }
   }
 
   /**
@@ -679,7 +822,7 @@ class flag_flag {
         'timestamp' => REQUEST_TIME,
       ))
       ->execute();
-    $this->_update_count($content_id);
+    $this->_increase_count($content_id);
     return $fcid;
   }
 
@@ -706,38 +849,67 @@ class flag_flag {
       ->fetchField();
     if ($fcid) {
       db_delete('flag_content')->condition('fcid', $fcid)->execute();
-      $this->_update_count($content_id);
+      $this->_decrease_count($content_id);
     }
     return $fcid;
   }
 
   /**
-   * Updates the flag count for this content
+   * Increases the flag count for a piece of content.
+   *
+   * @param $content_id
+   *   For which item should the count be increased.
+   * @param $number
+   *   The amount of counts to increasing. Defaults to 1.
    *
    * @private
-   */
-  function _update_count($content_id) {
-    $count = db_select('flag_content', 'fc')->fields('fc', array('fcid'))
+  */
+  function _increase_count($content_id, $number = 1) {
+    db_merge('flag_counts')
+      ->key(array(
+        'fid' => $this->fid,
+        'content_id' => $content_id,
+      ))
+      ->fields(array(
+        'content_type' => $this->content_type,
+        'count' => $number,
+        'last_updated' => REQUEST_TIME,
+      ))
+      ->updateFields(array(
+        'last_updated' => REQUEST_TIME,
+      ))
+      ->expression('count', 'count + :inc', array(':inc' => $number))
+      ->execute();
+  }
+
+  /**
+   * Decreases the flag count for a piece of content.
+   *
+   * @param $content_id
+   *   For which item should the count be descreased.
+   * @param $number
+   *   The amount of counts to decrease. Defaults to 1.
+   *
+   * @private
+  */
+  function _decrease_count($content_id, $number = 1) {
+    // Delete rows with count 0, for data consistency and space-saving.
+    // Done before the db_update() to prevent out-of-bounds errors on "count".
+    db_delete('flag_counts')
       ->condition('fid', $this->fid)
       ->condition('content_id', $content_id)
-      ->countQuery()->execute()->fetchField();
-    if ($count == 0) {
-      db_delete('flag_counts')->condition('fid', $this->fid)->condition('content_id', $content_id)->execute();
-    }
-    else {
-      $num_updated = db_update('flag_counts')->fields(array('count' => $count))
-        ->condition('fid', $this->fid)
-        ->condition('content_id', $content_id)
-        ->execute();
-      if (!$num_updated) {
-        db_insert('flag_counts')->fields(array(
-          'fid' => $this->fid,
-          'content_type' => $this->content_type,
-          'content_id' => $content_id,
-          'count' => $count))
-          ->execute();
-      }
-    }
+      ->condition('count', $number, '<=')
+      ->execute();
+
+    // Update the count with the new value otherwise.
+    db_update('flag_counts')
+      ->expression('count', 'count - :inc', array(':inc' => $number))
+      ->fields(array(
+        'last_updated' => REQUEST_TIME,
+      ))
+      ->condition('fid', $this->fid)
+      ->condition('content_id', $content_id)
+      ->execute();
   }
 
   /**
@@ -826,6 +998,11 @@ class flag_flag {
    * token contexts they understand.
    */
   function replace_tokens($label, $contexts, $options, $content_id) {
+    if (strpos($label , 'flagging:') !== FALSE) {
+      if (($flagging = $this->get_flagging($content_id))) {
+        $contexts['flagging'] = $flagging;
+      }
+    }
     return token_replace($label, $contexts, $options);
   }
 
@@ -837,7 +1014,7 @@ class flag_flag {
    * Derived classes should override this.
    */
   function get_labels_token_types() {
-    return array();
+    return array('flagging');
   }
 
   /**
@@ -1242,8 +1419,8 @@ class flag_node extends flag_flag {
     return FALSE;
   }
 
-  function access_multiple($content_ids, $account = NULL) {
-    $access = parent::access_multiple($content_ids, $account);
+  function type_access_multiple($content_ids, $account = NULL) {
+    $access = array();
 
     // Ensure that only flaggable node types are granted access. This avoids a
     // node_load() on every type, usually done by applies_to_content_id().
@@ -1287,9 +1464,9 @@ class flag_node extends flag_flag {
     return FALSE;
   }
 
-  function flag($action, $content_id, $account = NULL, $skip_permission_check = FALSE) {
+  function flag($action, $content_id, $account = NULL, $skip_permission_check = FALSE, $flagging = NULL) {
     $content_id = $this->get_translation_id($content_id);
-    return parent::flag($action, $content_id, $account, $skip_permission_check);
+    return parent::flag($action, $content_id, $account, $skip_permission_check, $flagging);
   }
 
   // Instead of overriding is_flagged() we override get_flagging_record(),
@@ -1406,9 +1583,8 @@ class flag_comment extends flag_flag {
     return FALSE;
   }
 
-  function access_multiple($content_ids, $account = NULL) {
-    $account = isset($account) ? $account : $GLOBALS['user'];
-    $access = parent::access_multiple($content_ids, $account);
+  function type_access_multiple($content_ids, $account) {
+    $access = array();
 
     // Ensure node types are granted access. This avoids a
     // node_load() on every type, usually done by applies_to_content_id().
@@ -1535,29 +1711,23 @@ class flag_user extends flag_flag {
     return FALSE;
   }
 
-  function access($content_id, $action = NULL, $account = NULL) {
-    $access = parent::access($content_id, $action, $account);
-    $account = isset($account) ? $account : $GLOBALS['user'];
-
+  function type_access($content_id, $action, $account) {
     // Prevent users from flagging themselves.
     if ($this->access_uid == 'others' && $content_id == $account->uid) {
-      $access = FALSE;
+      return FALSE;
     }
-
-    return $access;
   }
 
-  function access_multiple($content_ids, $account = NULL) {
-    $account = isset($account) ? $account : $GLOBALS['user'];
-    $access = parent::access_multiple($content_ids, $account);
+  function type_access_multiple($content_ids, $account) {
+    $access = array();
 
     // Exclude anonymous.
-    if (array_key_exists(0, $access)) {
+    if (array_key_exists(0, $content_ids)) {
       $access[0] = FALSE;
     }
 
     // Prevent users from flagging themselves.
-    if ($this->access_uid == 'others' && array_key_exists($account->uid, $access)) {
+    if ($this->access_uid == 'others' && array_key_exists($account->uid, $content_ids)) {
       $access[$account->uid] = FALSE;
     }
 
@@ -1796,4 +1966,3 @@ class FlagNonGlobalCookieStorage extends FlagCookieStorage {
     }
   }
 }
-
