@@ -157,7 +157,7 @@ class flag_handler_relationship_content extends flag_handler_relationship {
       $flag_roles = user_roles(FALSE, "flag $flag->name");
       if (isset($flag_roles[DRUPAL_ANONYMOUS_RID])) {
         // Disable page caching for anonymous users.
-        drupal_page_is_cacheable(FALSE);
+        //drupal_page_is_cacheable(FALSE);
 
         // Add in the SID from Session API for anonymous users.
         $this->definition['extra'][] = array(
