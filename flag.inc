@@ -1982,7 +1982,12 @@ class FlagNonGlobalCookieStorage extends FlagCookieStorage {
 
   protected function write() {
     $serialized = implode(' ', array_filter($this->flaggings));
-    setcookie('flags', $serialized, REQUEST_TIME + $this->get_lifetime(), base_path());
+    // Previously $lifetime always was REQUEST_TIME + $this->get_lifetime().
+    // In case if $this->get_lifetime() returned zero, the cookie lifetime was
+    // set to the current time, so it expire immediately after it was set in the
+    // browser. In other words, it did not work at all. Now handle this case.
+    $lifetime = $this->get_lifetime() ? REQUEST_TIME + $this->get_lifetime() : 0;
+    setcookie('flags', $serialized, $lifetime, base_path());
     $_COOKIE['flags'] = $serialized;
   }
 
