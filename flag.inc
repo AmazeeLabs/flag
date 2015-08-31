@@ -1987,7 +1987,41 @@ class FlagNonGlobalCookieStorage extends FlagCookieStorage {
     // set to the current time, so it expire immediately after it was set in the
     // browser. In other words, it did not work at all. Now handle this case.
     $lifetime = $this->get_lifetime() ? REQUEST_TIME + $this->get_lifetime() : 0;
-    setcookie('flags', $serialized, $lifetime, base_path());
+
+    // When calling the setcookie() repeatedly, all the calling history will be
+    // sent to the browser, which may result in pretty big headers. The issue
+    // was reported also in http://jira.amazeelabs.com/browse/EXPED-1023. To
+    // avoid this, instead of calling setcookie() all the time, we register a
+    // shutdown function which will do this. So we just prepare the data for the
+    // shutdown function and we will make the setcookie() call there. But,
+    // because this method will be called many times, we first check if there is
+    // already the "flag_write_flags_cookie_shutdown" function set as a shutdown
+    // and if yes we just change the parameters.
+    $callbacks = &drupal_register_shutdown_function();
+    $flag_shutdown_index = NULL;
+    if (!empty ($callbacks)) {
+      foreach ($callbacks as $key => $callback) {
+        if ($callback['callback'] == 'flag_write_flags_cookie_shutdown') {
+          $flag_shutdown_index = $key;
+          break;
+        }
+      }
+    }
+    // VERY VERY IMPORTANT: We need to reset the $callbacks pointer, otherwise
+    // _drupal_shutdown_function() will not run properly. The problem is that
+    // the foreach() we did above advanced the array pointer to the one
+    // corresponding to the entry of "flag_write_flags_cookie_shutdown". In
+    // _drupal_shutdown_function() the each() php function will be used which
+    // will start from the last position of the pointer! The reset() sets the
+    // pointer to the beginning of the list.
+    reset($callbacks);
+    if (!is_null($flag_shutdown_index)) {
+      $callbacks[$flag_shutdown_index]['arguments'] = array($serialized, $lifetime);
+    }
+    else {
+      drupal_register_shutdown_function('flag_write_flags_cookie_shutdown', $serialized, $lifetime);
+    }
+
     $_COOKIE['flags'] = $serialized;
   }
 
@@ -2008,4 +2042,12 @@ class FlagNonGlobalCookieStorage extends FlagCookieStorage {
       unset($_COOKIE['flags']);
     }
   }
+}
+
+/**
+ * Shutdown function used to set the 'flags' cookie. See the explanations in
+ * FlagNonGlobalCookieStorage::write().
+ */
+function flag_write_flags_cookie_shutdown($serialized, $lifetime) {
+  setcookie('flags', $serialized, $lifetime, base_path());
 }
